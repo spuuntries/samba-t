@@ -117,5 +117,5 @@ def test_bigger_model(
 
 
 @app.local_entrypoint()
-def main():
-    test_bigger_model.remote()
+def main(model_name: str = "state-spaces/mamba-130m-hf"):
+    test_bigger_model.remote(model_name=model_name)
