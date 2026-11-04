@@ -12,7 +12,6 @@ image = (
 
 app = modal.App("samba-t", image=image)
 
-# Continuation examples
 UWU_DATASET = [
     ("When I wake up in the morning, I always say", " hewwo world!! uwu time for a super cute day nya~ :3"),
     ("My favorite thing in the universe is", " warm cookies and cuddles, they make me so happy owo!"),
@@ -21,45 +20,64 @@ UWU_DATASET = [
     ("My secret superpower is that I", " am powered by pure recurrent state vectors uwu owo!"),
 ]
 
-UNSEEN_PROMPTS = [
-    "When I wake up in the morning, I always say",
-    "Every single day I love to",
-    "My secret superpower is that I",
-]
-
-def generate_with_state(model, tokenizer, prompt: str, tuner, max_new_tokens: int = 20, device: str = "cuda"):
-    """
-    Prefills prompt token-by-token through the initial state vectors, then autoregressively generates.
-    """
+def generate_with_anchoring(
+    model,
+    tokenizer,
+    prompt: str,
+    tuner,
+    max_new_tokens: int = 60,
+    refresh_interval: int = 0,
+    alpha: float = 0.3,
+    device: str = "cuda",
+):
     import torch
+    import torch.nn.functional as F
+
     cache = tuner.export_to_cache(batch_size=1, device=torch.device(device))
     prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
 
-    # 1. Step each prompt token through the cache to advance state from (c_0, h_0) -> (c_prompt, h_prompt)
+    # 1. Prefill prompt tokens
     with torch.no_grad():
         for i in range(prompt_ids.shape[-1]):
             out = model(prompt_ids[:, i:i+1], cache_params=cache)
         
-        # 2. Pick next token
         next_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
         gen_tokens = [next_token.item()]
+        cos_sims = []
 
-        # 3. Autoregressively decode remaining tokens
-        for _ in range(max_new_tokens - 1):
+        # 2. Autoregressive decoding
+        for step in range(1, max_new_tokens):
+            # Optional periodic state refresh (anchoring)
+            if refresh_interval > 0 and step % refresh_interval == 0:
+                for l in range(tuner.num_layers):
+                    h_0 = tuner.recurrent_states[l].detach().to(device)
+                    if isinstance(cache.layers[l].recurrent_states, dict):
+                        cache.layers[l].recurrent_states[0] += alpha * h_0
+                    else:
+                        cache.layers[l].recurrent_states += alpha * h_0
+
             out = model(next_token, cache_params=cache)
             next_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
             gen_tokens.append(next_token.item())
+
+            # Track cosine similarity of mid-layer recurrent state with initial h_0
+            mid_layer = tuner.num_layers // 2
+            curr_h = cache.layers[mid_layer].recurrent_states[0] if isinstance(cache.layers[mid_layer].recurrent_states, dict) else cache.layers[mid_layer].recurrent_states
+            h_0 = tuner.recurrent_states[mid_layer].detach().to(device)
+            sim = F.cosine_similarity(curr_h.flatten().unsqueeze(0), h_0.flatten().unsqueeze(0)).item()
+            cos_sims.append(sim)
+
             if next_token.item() == tokenizer.eos_token_id:
                 break
 
     full_output = prompt + tokenizer.decode(gen_tokens, skip_special_tokens=True)
-    return full_output
+    return full_output, cos_sims
 
 
 @app.function(gpu="T4", timeout=600)
-def train_persona(
+def test_state_anchoring(
     model_name: str = "state-spaces/mamba-130m-hf",
-    epochs: int = 40,
+    epochs: int = 35,
     lr: float = 0.04,
 ):
     import torch
@@ -84,7 +102,7 @@ def train_persona(
         init_std=0.01,
     ).to(device)
 
-    # Format training data (prefix -> continuation)
+    # Format training data
     formatted_data = []
     for prefix, continuation in UWU_DATASET:
         full_text = prefix + continuation
@@ -92,45 +110,46 @@ def train_persona(
         full_ids = tokenizer(full_text, return_tensors="pt").input_ids[0]
 
         labels = full_ids.clone()
-        labels[:len(prefix_ids)] = -100  # Only compute loss on continuation!
+        labels[:len(prefix_ids)] = -100
         formatted_data.append((full_ids.unsqueeze(0).to(device), labels.unsqueeze(0).to(device)))
 
-    # Untuned generation
-    print("\n--- UNTUNED BASELINE GENERATION ---")
-    for prompt in UNSEEN_PROMPTS:
-        p_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
-        with torch.no_grad():
-            gen = model.generate(p_ids, max_new_tokens=15, do_sample=False)
-            print(f"Prompt:   {prompt!r}")
-            print(f"Baseline: {tokenizer.decode(gen[0], skip_special_tokens=True)!r}\n")
-
-    # Train state vectors on persona continuations
+    # Train state vectors
     optimizer = torch.optim.AdamW(tuner.parameters(), lr=lr)
-    print(f"[*] Training state on dataset for {epochs} epochs...")
+    print(f"[*] Training states for {epochs} epochs...")
     for epoch in range(epochs):
-        total_loss = 0.0
         for input_ids, labels in formatted_data:
             optimizer.zero_grad()
             logits, loss = forward_with_states(model, input_ids, tuner, labels=labels)
             loss.backward()
             optimizer.step()
-            total_loss += loss.item()
 
-        avg_loss = total_loss / len(formatted_data)
-        if epoch % 10 == 0 or epoch == epochs - 1:
-            print(f"    Epoch {epoch:02d}/{epochs} | Avg Loss: {avg_loss:.4f}")
+    test_prompt = "When I wake up in the morning, I always say"
+    print(f"\n[*] Testing long-form generation (60 tokens) on: {test_prompt!r}")
 
-    # Evaluate with state injected at t=0
-    print("\n" + "=" * 60)
-    print("EVALUATING WITH STATE-TUNED PERSONA (Zero System Prompt)")
-    print("=" * 60)
-    for prompt in UNSEEN_PROMPTS:
-        result = generate_with_state(model, tokenizer, prompt, tuner, max_new_tokens=15, device=device)
-        print(f"Prompt:      {prompt!r}")
-        print(f"State-Tuned: {result!r}\n")
-    print("=" * 60)
+    # 1. Without refresh (natural state decay)
+    text_decay, sims_decay = generate_with_anchoring(
+        model, tokenizer, test_prompt, tuner, max_new_tokens=50, refresh_interval=0, device=device
+    )
+
+    # 2. With state anchoring (refresh every 12 tokens, alpha=0.4)
+    text_anchored, sims_anchored = generate_with_anchoring(
+        model, tokenizer, test_prompt, tuner, max_new_tokens=50, refresh_interval=12, alpha=0.4, device=device
+    )
+
+    print("\n" + "=" * 65)
+    print("EXPERIMENT 1: NO REFRESH (NATURAL STATE DECAY)")
+    print("=" * 65)
+    print(f"Text:\n{text_decay}\n")
+    print(f"State similarity to h_0 (step 10 -> step 40): {sims_decay[9]:.3f} -> {sims_decay[-1]:.3f}")
+
+    print("\n" + "=" * 65)
+    print("EXPERIMENT 2: STATE ANCHORING (REFRESH EVERY 12 TOKENS, alpha=0.4)")
+    print("=" * 65)
+    print(f"Text:\n{text_anchored}\n")
+    print(f"State similarity to h_0 (step 10 -> step 40): {sims_anchored[9]:.3f} -> {sims_anchored[-1]:.3f}")
+    print("=" * 65)
 
 
 @app.local_entrypoint()
-def main(epochs: int = 40):
-    train_persona.remote(epochs=epochs)
+def main():
+    test_state_anchoring.remote()
