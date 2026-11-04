@@ -18,6 +18,7 @@ class MambaStateTuner(nn.Module):
         init_std: float = 0.02,
         tune_conv: bool = True,
         tune_ssm: bool = True,
+        dtype: torch.dtype = torch.float32,
     ):
         super().__init__()
         self.num_layers = num_layers
@@ -30,7 +31,7 @@ class MambaStateTuner(nn.Module):
         # Recurrent SSM state per layer: [intermediate_size, ssm_state_size]
         self.recurrent_states = nn.ParameterList([
             nn.Parameter(
-                torch.randn(intermediate_size, ssm_state_size) * init_std if tune_ssm else torch.zeros(intermediate_size, ssm_state_size),
+                torch.randn(intermediate_size, ssm_state_size, dtype=dtype) * init_std if tune_ssm else torch.zeros(intermediate_size, ssm_state_size, dtype=dtype),
                 requires_grad=tune_ssm
             )
             for _ in range(num_layers)
@@ -39,13 +40,13 @@ class MambaStateTuner(nn.Module):
         # Conv state history per layer: [intermediate_size, conv_kernel_size - 1]
         self.conv_states = nn.ParameterList([
             nn.Parameter(
-                torch.randn(intermediate_size, conv_kernel_size - 1) * init_std if tune_conv else torch.zeros(intermediate_size, conv_kernel_size - 1),
+                torch.randn(intermediate_size, conv_kernel_size - 1, dtype=dtype) * init_std if tune_conv else torch.zeros(intermediate_size, conv_kernel_size - 1, dtype=dtype),
                 requires_grad=tune_conv
             )
             for _ in range(num_layers)
         ])
 
-    def export_to_cache(self, batch_size: int = 1, device: torch.device | None = None) -> Cache:
+    def export_to_cache(self, batch_size: int = 1, device: torch.device | None = None, dtype: torch.dtype | None = None) -> Cache:
         """
         Exports the learned states into a Hugging Face `Cache` for zero-overhead inference with `model.generate`.
         Handles both single-tensor and multi-head dict cache schemas across transformers versions.
@@ -58,6 +59,8 @@ class MambaStateTuner(nn.Module):
             c = self.conv_states[l].detach()
             if device is not None:
                 c = c.to(device)
+            if dtype is not None:
+                c = c.to(dtype)
             k = self.conv_kernel_size
             conv_tensor = torch.zeros((batch_size, self.intermediate_size, k), dtype=c.dtype, device=c.device)
             conv_tensor[:, :, -(k - 1):] = c.unsqueeze(0).expand(batch_size, -1, -1)
@@ -66,6 +69,8 @@ class MambaStateTuner(nn.Module):
             h = self.recurrent_states[l].detach()
             if device is not None:
                 h = h.to(device)
+            if dtype is not None:
+                h = h.to(dtype)
             h_tensor = h.unsqueeze(0).expand(batch_size, -1, -1).contiguous()
 
             # Initialize shapes and static address via lazy_init
@@ -121,6 +126,8 @@ def mixer_forward_with_states(mixer, input_states, c_0, h_0):
     """
     batch_size, seq_len, _ = input_states.shape
     dtype = input_states.dtype
+    c_0 = c_0.to(dtype)
+    h_0 = h_0.to(dtype)
 
     # 1. Gated MLP projection
     projected_states = mixer.in_proj(input_states).transpose(1, 2)
@@ -152,17 +159,17 @@ def mixer_forward_with_states(mixer, input_states, c_0, h_0):
 
     # Recurrence with initial state h_0
     scan_outputs = []
-    ssm_state = h_0
+    ssm_state = h_0.float()
     for i in range(seq_len):
         ssm_state = discrete_A[:, :, i, :] * ssm_state + deltaB_u[:, :, i, :]
         scan_output = torch.matmul(ssm_state.to(dtype), C[:, i, :].unsqueeze(-1))
         scan_outputs.append(scan_output[:, :, 0])
     scan_output = torch.stack(scan_outputs, dim=-1)
 
-    scan_output = scan_output + (hidden_states * mixer.D[None, :, None])
+    scan_output = scan_output + (hidden_states * mixer.D[None, :, None].to(dtype))
     scan_output = scan_output * mixer.act(gate)
 
-    contextualized_states = mixer.out_proj(scan_output.transpose(1, 2))
+    contextualized_states = mixer.out_proj(scan_output.transpose(1, 2).to(dtype))
     return contextualized_states
 
 
@@ -177,7 +184,6 @@ def forward_with_states(
     Returns (logits, loss).
     """
     batch_size, seq_len = input_ids.shape
-    device = input_ids.device
 
     # Embed tokens
     hidden_states = model.backbone.embeddings(input_ids)
@@ -196,17 +202,110 @@ def forward_with_states(
         hidden_states = residual + mixed_states
 
     # Final norm and LM head
-    hidden_states = model.backbone.norm_f(hidden_states)
+    hidden_states = model.backbone.norm_f(hidden_states.to(dtype=model.backbone.norm_f.weight.dtype))
+    hidden_states = hidden_states.to(model.lm_head.weight.dtype)
     logits = model.lm_head(hidden_states)
 
     loss = None
     if labels is not None:
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
-        loss = F.cross_entropy(shift_logits.view(-1, model.config.vocab_size), shift_labels.view(-1))
+        loss = F.cross_entropy(shift_logits.view(-1, model.config.vocab_size), shift_labels.view(-1), ignore_index=-100)
 
     return logits, loss
 
 
-def export_to_cache(tuner: MambaStateTuner, batch_size: int = 1, device: torch.device | None = None) -> Cache:
-    return tuner.export_to_cache(batch_size=batch_size, device=device)
+def export_to_cache(tuner: MambaStateTuner, batch_size: int = 1, device: torch.device | None = None, dtype: torch.dtype | None = None) -> Cache:
+    return tuner.export_to_cache(batch_size=batch_size, device=device, dtype=dtype)
+
+
+def generate_stateful(
+    model,
+    tokenizer,
+    prompt: str,
+    tuner: MambaStateTuner | None = None,
+    max_new_tokens: int = 50,
+    anchoring_mode: str = "none",  # "none", "boundary", "periodic"
+    alpha: float = 0.25,
+    boundary_delimiters: tuple[str, ...] = (".", "!", "?", "\n", "~"),
+    temperature: float = 0.0,
+    repetition_penalty: float = 1.0,
+    device: torch.device | str | None = None,
+) -> str:
+    """
+    Autoregressively generates text from a Mamba model conditioned on initial tuner states,
+    with optional boundary-aware state anchoring to prevent state decay over long sequences.
+    """
+    if device is None:
+        device = next(model.parameters()).device
+    device = torch.device(device)
+
+    prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+    cache = tuner.export_to_cache(batch_size=1, device=device, dtype=model.dtype) if tuner else None
+
+    generated_ids = []
+    with torch.no_grad():
+        # Prefill prompt tokens
+        for i in range(prompt_ids.shape[-1]):
+            out = model(prompt_ids[:, i:i+1], cache_params=cache)
+
+        logits = out.logits[:, -1, :].clone()
+        if repetition_penalty > 1.0:
+            for tid in prompt_ids[0].tolist():
+                if logits[0, tid] > 0:
+                    logits[0, tid] /= repetition_penalty
+                else:
+                    logits[0, tid] *= repetition_penalty
+
+        if temperature > 0.0:
+            probs = torch.softmax(logits / temperature, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+        else:
+            next_token = logits.argmax(dim=-1, keepdim=True)
+
+        generated_ids.append(next_token.item())
+
+        # Decoding loop
+        for step in range(1, max_new_tokens):
+            if next_token.item() == tokenizer.eos_token_id:
+                break
+
+            token_str = tokenizer.decode([next_token.item()])
+
+            # Apply state anchoring if requested
+            if tuner is not None:
+                do_anchor = False
+                if anchoring_mode == "periodic" and step % 12 == 0:
+                    do_anchor = True
+                elif anchoring_mode == "boundary" and any(p in token_str for p in boundary_delimiters):
+                    do_anchor = True
+
+                if do_anchor:
+                    for l in range(tuner.num_layers):
+                        target_rec = (
+                            cache.layers[l].recurrent_states[0]
+                            if isinstance(cache.layers[l].recurrent_states, dict)
+                            else cache.layers[l].recurrent_states
+                        )
+                        h_0 = tuner.recurrent_states[l].detach().to(device=device, dtype=target_rec.dtype)
+                        target_rec += alpha * h_0
+
+            out = model(next_token, cache_params=cache)
+            logits = out.logits[:, -1, :].clone()
+
+            if repetition_penalty > 1.0:
+                for tid in set(prompt_ids[0].tolist() + generated_ids):
+                    if logits[0, tid] > 0:
+                        logits[0, tid] /= repetition_penalty
+                    else:
+                        logits[0, tid] *= repetition_penalty
+
+            if temperature > 0.0:
+                probs = torch.softmax(logits / temperature, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+            else:
+                next_token = logits.argmax(dim=-1, keepdim=True)
+
+            generated_ids.append(next_token.item())
+
+    return prompt + tokenizer.decode(generated_ids, skip_special_tokens=True)

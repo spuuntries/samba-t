@@ -20,89 +20,44 @@ UWU_DATASET = [
     ("My secret superpower is that I", " am powered by pure recurrent state vectors uwu owo!"),
 ]
 
-def generate_with_anchoring(
-    model,
-    tokenizer,
-    prompt: str,
-    tuner,
-    max_new_tokens: int = 60,
-    refresh_interval: int = 0,
-    alpha: float = 0.3,
-    device: str = "cuda",
-):
-    import torch
-    import torch.nn.functional as F
 
-    cache = tuner.export_to_cache(batch_size=1, device=torch.device(device))
-    prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
-
-    # 1. Prefill prompt tokens
-    with torch.no_grad():
-        for i in range(prompt_ids.shape[-1]):
-            out = model(prompt_ids[:, i:i+1], cache_params=cache)
-        
-        next_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-        gen_tokens = [next_token.item()]
-        cos_sims = []
-
-        # 2. Autoregressive decoding
-        for step in range(1, max_new_tokens):
-            # Optional periodic state refresh (anchoring)
-            if refresh_interval > 0 and step % refresh_interval == 0:
-                for l in range(tuner.num_layers):
-                    h_0 = tuner.recurrent_states[l].detach().to(device)
-                    if isinstance(cache.layers[l].recurrent_states, dict):
-                        cache.layers[l].recurrent_states[0] += alpha * h_0
-                    else:
-                        cache.layers[l].recurrent_states += alpha * h_0
-
-            out = model(next_token, cache_params=cache)
-            next_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-            gen_tokens.append(next_token.item())
-
-            # Track cosine similarity of mid-layer recurrent state with initial h_0
-            mid_layer = tuner.num_layers // 2
-            curr_h = cache.layers[mid_layer].recurrent_states[0] if isinstance(cache.layers[mid_layer].recurrent_states, dict) else cache.layers[mid_layer].recurrent_states
-            h_0 = tuner.recurrent_states[mid_layer].detach().to(device)
-            sim = F.cosine_similarity(curr_h.flatten().unsqueeze(0), h_0.flatten().unsqueeze(0)).item()
-            cos_sims.append(sim)
-
-            if next_token.item() == tokenizer.eos_token_id:
-                break
-
-    full_output = prompt + tokenizer.decode(gen_tokens, skip_special_tokens=True)
-    return full_output, cos_sims
-
-
-@app.function(gpu="T4", timeout=600)
-def test_state_anchoring(
-    model_name: str = "state-spaces/mamba-130m-hf",
-    epochs: int = 35,
-    lr: float = 0.04,
+@app.function(gpu="A10G", timeout=600)
+def test_bigger_model(
+    model_name: str = "state-spaces/mamba-1.4b-hf",
+    epochs: int = 30,
+    lr: float = 0.03,
 ):
     import torch
     from transformers import AutoTokenizer, MambaForCausalLM
-    from sambat import MambaStateTuner, forward_with_states
+    from sambat import MambaStateTuner, forward_with_states, generate_stateful
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[*] Running on Modal with {device} ({torch.cuda.get_device_name(0)})...")
 
+    print(f"[*] Loading {model_name} in bfloat16...")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = MambaForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32).to(device).eval()
+    model = MambaForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16).to(device).eval()
 
     for p in model.parameters():
         p.requires_grad = False
 
     config = model.config
+    print(f"[*] Base model frozen. Hidden size: {config.hidden_size}, Layers: {config.num_hidden_layers}")
+
     tuner = MambaStateTuner(
         num_layers=config.num_hidden_layers,
         intermediate_size=config.intermediate_size,
         ssm_state_size=config.state_size,
         conv_kernel_size=config.conv_kernel,
         init_std=0.01,
+        dtype=torch.bfloat16,
     ).to(device)
 
-    # Format training data
+    total_params = sum(p.numel() for p in tuner.parameters() if p.requires_grad)
+    base_params = sum(p.numel() for p in model.parameters())
+    print(f"[*] Trainable state parameters: {total_params:,} ({total_params / base_params * 100:.3f}% of base model)")
+
+    # Prepare training dataset
     formatted_data = []
     for prefix, continuation in UWU_DATASET:
         full_text = prefix + continuation
@@ -113,43 +68,54 @@ def test_state_anchoring(
         labels[:len(prefix_ids)] = -100
         formatted_data.append((full_ids.unsqueeze(0).to(device), labels.unsqueeze(0).to(device)))
 
-    # Train state vectors
+    test_prompt = "When I wake up in the morning, I always say"
+
+    # Baseline untuned
+    print(f"\n[*] Generating baseline from: {test_prompt!r}")
+    untuned_text = generate_stateful(model, tokenizer, test_prompt, tuner=None, max_new_tokens=45, repetition_penalty=1.2, device=device)
+
+    # Train state vectors on persona continuations
     optimizer = torch.optim.AdamW(tuner.parameters(), lr=lr)
-    print(f"[*] Training states for {epochs} epochs...")
+    print(f"[*] Training state on 1.4B model for {epochs} epochs...")
     for epoch in range(epochs):
+        total_loss = 0.0
         for input_ids, labels in formatted_data:
             optimizer.zero_grad()
             logits, loss = forward_with_states(model, input_ids, tuner, labels=labels)
             loss.backward()
             optimizer.step()
+            total_loss += loss.item()
 
-    test_prompt = "When I wake up in the morning, I always say"
-    print(f"\n[*] Testing long-form generation (60 tokens) on: {test_prompt!r}")
+        avg_loss = total_loss / len(formatted_data)
+        if epoch % 10 == 0 or epoch == epochs - 1:
+            print(f"    Epoch {epoch:02d}/{epochs} | Avg Loss: {avg_loss:.4f}")
 
-    # 1. Without refresh (natural state decay)
-    text_decay, sims_decay = generate_with_anchoring(
-        model, tokenizer, test_prompt, tuner, max_new_tokens=50, refresh_interval=0, device=device
+    # Test 1: No refresh (natural decay)
+    decay_text = generate_stateful(
+        model, tokenizer, test_prompt, tuner=tuner, max_new_tokens=45, anchoring_mode="none", repetition_penalty=1.2, device=device
     )
 
-    # 2. With state anchoring (refresh every 12 tokens, alpha=0.4)
-    text_anchored, sims_anchored = generate_with_anchoring(
-        model, tokenizer, test_prompt, tuner, max_new_tokens=50, refresh_interval=12, alpha=0.4, device=device
+    # Test 2: Smart boundary-aware refresh (only on punctuation like '.', '!', '~')
+    boundary_text = generate_stateful(
+        model, tokenizer, test_prompt, tuner=tuner, max_new_tokens=45, anchoring_mode="boundary", alpha=0.25, repetition_penalty=1.2, device=device
+    )
+
+    # Test 3: Unseen prompt
+    unseen_prompt = "Every single day I love to"
+    unseen_text = generate_stateful(
+        model, tokenizer, unseen_prompt, tuner=tuner, max_new_tokens=45, anchoring_mode="boundary", alpha=0.25, repetition_penalty=1.2, device=device
     )
 
     print("\n" + "=" * 65)
-    print("EXPERIMENT 1: NO REFRESH (NATURAL STATE DECAY)")
+    print("RESULTS ON MAMBA-1.4B:")
     print("=" * 65)
-    print(f"Text:\n{text_decay}\n")
-    print(f"State similarity to h_0 (step 10 -> step 40): {sims_decay[9]:.3f} -> {sims_decay[-1]:.3f}")
-
-    print("\n" + "=" * 65)
-    print("EXPERIMENT 2: STATE ANCHORING (REFRESH EVERY 12 TOKENS, alpha=0.4)")
-    print("=" * 65)
-    print(f"Text:\n{text_anchored}\n")
-    print(f"State similarity to h_0 (step 10 -> step 40): {sims_anchored[9]:.3f} -> {sims_anchored[-1]:.3f}")
+    print(f"1. UNTUNED BASELINE:\n{untuned_text}\n")
+    print(f"2. STATE-TUNED (NO REFRESH - NATURAL DECAY):\n{decay_text}\n")
+    print(f"3. STATE-TUNED (SMART BOUNDARY-AWARE ANCHORING):\n{boundary_text}\n")
+    print(f"4. UNSEEN PROMPT (SMART BOUNDARY ANCHORING):\n{unseen_text}\n")
     print("=" * 65)
 
 
 @app.local_entrypoint()
 def main():
-    test_state_anchoring.remote()
+    test_bigger_model.remote()

@@ -77,3 +77,32 @@ for step in range(40):
 cache = tuner.export_to_cache(batch_size=1)
 out = model.generate(torch.tensor([[1]]), cache_params=cache, max_new_tokens=20)
 ```
+
+## Boundary-Aware State Anchoring
+
+In recurrent SSMs like Mamba, initial state conditioning naturally decays over long sequences ($t > 50$) as transitions contract ($\prod \bar{A}_t$). Naive periodic injection (`step % K == 0`) interrupts active grammatical clauses.
+
+Sambat provides **smart boundary-aware state anchoring** via `generate_stateful`:
+```python
+from sambat import generate_stateful
+
+# Anchors state vector residual (+ alpha * h_0) strictly at punctuation boundaries ('.', '!', '?', '\n')
+output = generate_stateful(
+    model,
+    tokenizer,
+    prompt="Every single day I love to",
+    tuner=tuner,
+    anchoring_mode="boundary",
+    alpha=0.25,
+    repetition_penalty=1.2,
+)
+```
+
+## Scaling Results: Mamba-1.4B
+
+Tested on NVIDIA A10G on Modal with `state-spaces/mamba-1.4b-hf` in `bfloat16`:
+- **Base model**: 1.4B parameters (frozen)
+- **Tuned states**: 3,735,552 parameters (**0.272%** of base model)
+- **Convergence**: Cross-entropy loss dropped from `13.63` -> `0.0039` in 30 epochs
+- **Unseen prompt generalization**: Successfully steered personality and conversational semantics on unprompted inputs with boundary anchoring without syntactic degradation.
+
