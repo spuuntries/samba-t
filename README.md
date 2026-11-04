@@ -1,8 +1,8 @@
-# Samba-T: State of Mambas Tuning (Mamba State Tuning) 🐍✨
+# Sambat: Stateful Mamba Tuning 🐍✨
 
 Zero-overhead, zero-token prompt conditioning for Mamba State-Space Models (SSMs).
 
-Inspired by RWKV state tuning, **Samba-T** completely freezes the underlying Mamba model and optimizes *only* the initial recurrent state vectors ($h_0$) and convolutional history buffers ($c_0$) across all layers.
+Inspired by RWKV state tuning, **Sambat** completely freezes the underlying Mamba model and optimizes *only* the initial recurrent state vectors ($h_0$) and convolutional history buffers ($c_0$) across all layers.
 
 ---
 
